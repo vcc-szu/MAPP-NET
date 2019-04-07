@@ -7,6 +7,7 @@ from __future__ import (
 )
 import torch
 import torch.nn as nn
+import torch.nn.functional as torchF
 import etw_pytorch_utils as pt_utils
 from collections import namedtuple
 
@@ -17,73 +18,275 @@ from pointnet2.utils.pointnet2_modules import PointnetFPModule, PointnetSAModule
 from mappnet.config import config as global_config
 
 ModelReturn = namedtuple("ModelReturn", ["preds", "loss", "acc"])
-def reconstruction_loss(pred_pc, target, seg):
+# def get_rec_loss(pred_pc, target, seg):
+#     """ pred_pc: BxFxNx3,
+#         target: BxFxNx3, 
+#         seg: BxN """
+#     #single_target = target[:,0,:,:]
+#     l2 = torch.norm(target - pred_pc, dim=-1)
+#     l2_avg = torch.mean(l2)
+#     return l2_avg
+def pairwise_l2_norm2_batch(x, y):
+    """ x,y: Fxnx3
+        
+        return:
+        squre_dist: (F, nump_x, nump_y)
+    """
+    nump_x = x.size()[1]
+    nump_y = y.size()[1]
+    num_frame, num_point, num_channel = x.size()
+
+    xx = x.view(num_frame, nump_x, 1, num_channel).repeat(1,1, nump_y, 1)
+    yy = y.view(num_frame, nump_y, 1, num_channel).repeat(1,1, nump_x, 1)
+    yy = yy.permute(0, 2, 1, 3) # yy = y'
+
+    diff = xx - yy # x - y'
+    square_diff = diff ** 2
+    square_dist = torch.sum(square_diff, dim=-1)
+
+    return square_dist
+def get_chamfer_loss(pred_pc, target_pc, target_seg):
     """ pred_pc: BxFxNx3,
-        target: BxFxNx3, 
-        seg: BxN """
-    #single_target = target[:,0,:,:]
-    l2 = torch.norm(target - pred_pc, dim=-1)
-    l2_avg = torch.mean(l2)
-    return l2_avg
+        target_pc: BxFxNx3, 
+        target_seg: BxN """
+    batch_size, num_frame, num_point, _  = pred_pc.size()
+    seg_mask = (target_seg==1)
 
+    chamferLoss = 0
+    #densityLoss = 0
+    for k in range(batch_size):
+        pred_pc_n =  pred_pc[k,:,seg_mask[k],:]
+        target_pc_n = target_pc[k,:,seg_mask[k],:]
+        # calculate chamfer loss
+        square_dist = pairwise_l2_norm2_batch(target_pc_n, pred_pc_n)
+        dist = torch.sqrt(square_dist)
+        minRow, _ = torch.min(dist, dim=-1) # min yi to x
+        minCol, _ = torch.min(dist, dim=-2) # min xi to y
+        chamferLoss += ( torch.sum(minRow) + torch.sum(minCol) ) / num_frame
 
-def mappnet_fn(model, data, epoch=0,eval=False):
-    with torch.set_grad_enabled(not eval):
-        pc_in = data['pc_in']
-        pc_target = data['pc_target']
-        seg = data['seg']
+        # calculate density loss
+        # square_dist2 = pairwise_l2_norm2_batch(target_pc_n, target_pc_n)
+        # dist2 = torch.sqrt(square_dist2)
+        # knndis = tf.nn.top_k(tf.negative(dist), k=8)
+        # knndis2 = tf.nn.top_k(tf.negative(dist2), k=8)
+        # densityLoss += torch.mean(torch.abs(knndis.values - knndis2.values))
+    
+    chamferLoss /= batch_size
+    #densityLoss /= batch_size
+    #loss_chamfer = (shapeLoss + densityLoss) * num_frame
+    #tf.summary.scalar('loss_chamfer', loss_chamfer)
+    #tf.add_to_collection('losses', loss_chamfer)
+    return chamferLoss#, shapeLoss, densityLoss
 
-        pc_in = pc_in.to("cuda", non_blocking=True)
-        pc_target = pc_target.to("cuda", non_blocking=True)
-        seg = seg.to("cuda", non_blocking=True)
+def get_rec_loss(pred_disp, target_disp, target_seg):
+    """ pred_disp: BxFxNx3,
+        target_disp: BxFxNx3, 
+        target_seg: BxN """
+    batch_size, num_frame, num_point, _ = pred_disp.size()
+    
+    target_seg = target_seg.type(torch.cuda.FloatTensor)
+    target_seg_reverse = 1.0 - target_seg
+    num_mov = torch.sum(target_seg, dim=-1)
+    num_ref = torch.sum(target_seg_reverse, dim=-1)
 
-        preds = model(pc_in)
-        loss = mappnet_model.reconstruction_loss(preds, pc_target[:,0,:,:]-pc_in, seg)
-        #_, classes = torch.max(preds, -1)
-        acc = 0#(classes == labels).float().sum() / labels.numel()
-        #if eval==True:
-    return ModelReturn(preds, loss, {"loss": loss.item()})
+    l2 = torch.norm(target_disp-pred_disp, dim=-1)
+    perframe_mov_loss = []
+    perframe_ref_loss = []
+    for i in range(batch_size):
+        perframe_mov_loss.append(torch.sum(l2[i]*target_seg[i], dim=-1) / num_mov[i])
+        perframe_ref_loss.append(torch.sum(l2[i]*target_seg_reverse[i], dim=-1) / num_ref[i])
+
+    perframe_mov_loss = torch.stack(perframe_mov_loss)
+    perframe_ref_loss = torch.stack(perframe_ref_loss)
+    mov_loss = torch.mean(perframe_mov_loss)
+    ref_loss = torch.mean(perframe_ref_loss) * 10
+    loss_rec = mov_loss + ref_loss
+
+    #tf.summary.scalar('loss_rec', loss_rec)
+    #tf.add_to_collection('losses', loss_rec)
+    return loss_rec#, mov_loss, ref_loss, perframe_mov_loss, perframe_ref_loss
+
+def get_seg_loss(pred_seg, target_seg):
+    """ pred_seg: BxNxC,
+        seg: BxN, """
+    loss_seg = torchF.cross_entropy(input = pred_seg.permute(0,2,1), target = target_seg)
+    #tf.summary.scalar('loss_seg', loss_seg)
+    #tf.add_to_collection('losses', loss_seg)
+    return loss_seg
+
+def get_reg_loss(pred_reg, target_reg):
+    """ pred_reg: Bx6,
+        target_reg: Bx6, """
+    loss_reg = torch.mean(torch.norm(pred_reg-target_reg, dim=-1))
+    #tf.summary.scalar('loss_reg', loss_reg)
+    #tf.add_to_collection('losses', loss_reg)
+    return loss_reg
+
+def get_cls_loss(pred_cls, target_cls):
+    """ pred_cls: B*NUM_CLASSES,
+        target_cls: B, """
+    loss = torchF.cross_entropy(input = pred_cls, target = target_cls)
+    loss_cls = torch.mean(loss)
+    #tf.summary.scalar('loss_cls', loss_cls)
+    #tf.add_to_collection('losses', loss_cls)
+    return loss_cls
+
+def get_disp_loss(input_pc, pred_pc, target_pc, target_seg, target_mo, target_cls):
+    """ input_pc(tiled): BxFxNx3,
+        pred_pc: BxFxNx3,
+        target_pc: BxFxNx3,
+        target_seg: BxN
+        target_mo: Bx6,
+        target_cls: B,"""
+    # only keep moving part
+    batch_size, num_frame, num_point, num_channel = pred_pc.size()
+
+    # target_cls = tf.cast(target_cls, dtype=tf.float32)
+    seg_mask = (target_seg==1)
+    mo_pos = target_mo[:,0:3]
+    mo_dir = target_mo[:,3:]
+    tiled_mo_dir = mo_dir.view(batch_size, 1, -1).repeat(1, num_point, 1)
+    tiled_mo_pos = mo_pos.view(batch_size, 1, -1).repeat(1, num_point, 1)
+
+    loss_r1_sum = 0
+    loss_r2_sum = 0
+    loss_r3_sum = 0
+    loss_t1_sum = 0
+    loss_t2_sum = 0
+    loss_tr_sum = 0
+    for k in range(batch_size):
+        loss_r1 = 0
+        loss_r2 = 0
+        loss_r3 = 0
+        loss_t1 = 0
+        loss_t2 = 0        
+        for i in range(num_frame):
+            """(Nmov)*3"""
+            input_pc_n =  input_pc[k,i,seg_mask[k],:]
+            pred_pc_n =  pred_pc[k,i,seg_mask[k],:]
+            target_pc_n = target_pc[k,i,seg_mask[k],:]
+            tiled_mo_dir_n =  tiled_mo_dir[k,seg_mask[k],:]
+            tiled_mo_pos_n = tiled_mo_pos[k,seg_mask[k],:]
+            pred_disp_n = pred_pc_n - input_pc_n
+            v1 = tiled_mo_dir_n
+            v2 = input_pc_n - tiled_mo_pos_n
+            v3 = pred_pc_n - tiled_mo_pos_n
+
+            ''' constrain direction perpendicular '''
+            v1_norm = torchF.normalize(pred_disp_n, dim=-1)
+            v2_norm = torchF.normalize(tiled_mo_dir_n, dim=-1)
+            cos = torch.sum(v1_norm * v2_norm, dim=-1)
+            loss_r1 += torch.mean(torch.abs(cos))
+            loss_t1 += torch.mean(torch.abs(1.0 - cos))
+
+            ''' constrain moving angle consistency '''
+            lenproject1 = torch.sum(v2 * v1, dim=-1) / torch.sum(v1 * v1, dim=-1)
+            lenproject2 = torch.sum(v3 * v1, dim=-1) / torch.sum(v1 * v1, dim=-1)
+            lenproject1 = lenproject1.view(-1,1).repeat(1, 3)
+            lenproject2 = lenproject2.view(-1,1).repeat(1, 3)
+            projpoint1 = tiled_mo_pos_n + lenproject1 * v1
+            projpoint2 = tiled_mo_pos_n + lenproject2 * v1
+            
+            cos_pred = torch.sum(torchF.normalize(input_pc_n - projpoint1, dim=-1) * torchF.normalize(pred_pc_n - projpoint2, dim=-1), dim=-1)
+            mean = cos_pred.mean(dim=0)
+            variance = cos_pred.std(dim=0)
+            loss_r2 += variance
+            
+            loss_r3 += torch.mean(torch.abs(torch.norm(input_pc_n-projpoint1, dim=-1) - torch.norm(pred_pc_n-projpoint2, dim=-1)))
+
+            movdis = pred_disp_n.norm(dim=-1)
+            mean = movdis.mean(dim=0)
+            var = movdis.std(dim=0)
+            loss_t2 += var
+
+        loss_r1_sum += (1.0 - (target_cls[k]==0)) * loss_r1 / num_frame
+        loss_r2_sum += (1.0 - (target_cls[k]==0)) * loss_r2 / num_frame
+        loss_r3_sum += (1.0 - (target_cls[k]==0)) * loss_r3 / num_frame
+        loss_t1_sum += (1.0 - (target_cls[k]==1)) * loss_t1 / num_frame
+        loss_t2_sum += (1.0 - (target_cls[k]==1)) * loss_t2 / num_frame
+        # loss_r1_sum += target_cls[k] * loss_r1 / num_frame
+        # loss_r2_sum += target_cls[k] * loss_r2 / num_frame
+        # loss_r3_sum += target_cls[k] * loss_r3 / num_frame
+        # loss_t1_sum += (1-target_cls[k]) * loss_t1 / num_frame
+        # loss_t2_sum += (1-target_cls[k]) * loss_t2 / num_frame
+
+        loss_tr_sum += (1.0 - (target_cls[k]==2)) * (loss_r2 + loss_r3 + loss_t2) / num_frame
+
+    loss_r1_sum /= batch_size * 3
+    loss_r2_sum /= batch_size * 3
+    loss_r3_sum /= batch_size * 3
+    loss_t1_sum /= batch_size * 3
+    loss_t2_sum /= batch_size * 3
+    loss_tr_sum /= batch_size * 3
+
+    loss_r = loss_r1_sum + loss_r2_sum + loss_r3_sum
+    loss_t = loss_t1_sum + loss_t2_sum
+    loss_tr = loss_tr_sum
+
+    loss_disp = loss_r + loss_t + loss_tr
+    #tf.summary.scalar('loss_disp', loss_disp)
+    #tf.add_to_collection('losses', loss_disp)
+    return loss_disp#, loss_t1_sum, loss_t2_sum, loss_r1_sum, loss_r2_sum, loss_r3_sum
+
+def get_mappnet_loss(pred_disp, input_pc, target_disp, pred_seg, target_seg, pred_cls, target_cls, pred_mo, target_mo):
+    """ pred_disp BFNC, input_pc BFNC, target_disp BFNC, 
+        pred_seg BNC, target_seg BN, pred_cls B, target_cls B, pred_mo B(MC), target_mo B(MC)"""
+    pred_pc = pred_disp + input_pc
+    target_pc=target_disp+input_pc
+    loss_chamfer = get_chamfer_loss(pred_pc, target_pc, target_seg)
+    loss_rec     = get_rec_loss(pred_disp, target_disp, target_seg)
+    loss_disp    = get_disp_loss(input_pc, pred_pc, target_pc, target_seg, target_mo, target_cls)
+    loss_cls     = get_cls_loss(pred_cls, target_cls)
+    loss_seg     = get_seg_loss(pred_seg, target_seg)
+    loss_reg     = get_reg_loss(pred_mo, target_mo)
+    #torch.tensor(0).cuda()#
+    loss = loss_chamfer + loss_rec + loss_disp + loss_cls + loss_seg + loss_reg
+    return loss, loss_chamfer, loss_rec, loss_disp, loss_cls, loss_seg, loss_reg
+
 def model_fn_decorator(train_set, test_set, config):
-    ModelReturn = namedtuple("ModelReturn", ["preds", "loss", "acc"])
+    ModelReturn = namedtuple("ModelReturn", ["preds", "loss", "stat"])
+    generate_per_epoch = 10
     def mappnet_fn(model, data, epoch=0,eval=False):
         with torch.set_grad_enabled(not eval):
-            pc_in = data['pc_in']
-            pc_target = data['pc_target']
-            seg = data['seg']
-
-            pc_in = pc_in.to("cuda", non_blocking=True)
-            pc_target = pc_target.to("cuda", non_blocking=True)
-            seg = seg.to("cuda", non_blocking=True)
-
-            batch_size, num_frame, num_point, pc_channel = pc_target.size()
-
-            pc_in_tiled =   pc_in.view(batch_size,1,num_point,pc_channel)  \
+            data_term = ['input_pc', 'target_pc', 'target_seg', 'target_cls', 'target_mo']
+            dataCUDA=[]
+            for term in data_term:
+                dataCUDA.append(data[term].to("cuda", non_blocking=True))
+            input_pc, target_pc, target_seg, target_cls, target_mo = dataCUDA
+            batch_size, num_frame, num_point, pc_channel = target_pc.size()
+            input_pc_tiled =   input_pc.view(batch_size,1,num_point,pc_channel)  \
                                  .repeat(1,num_frame,1,1)
-            disp_target = pc_target - pc_in_tiled
+            target_disp = target_pc - input_pc_tiled
             
-            preds = model(pc_in)
-            loss = reconstruction_loss(preds, disp_target, seg)
-            #_, classes = torch.max(preds, -1)
-            acc = 0#(classes == labels).float().sum() / labels.numel()
+            pred_disp, pred_cls, pred_seg, pred_mo = model(input_pc)
+            loss, loss_chamfer, loss_rec, loss_disp, loss_cls, loss_seg, loss_reg = \
+                get_mappnet_loss(pred_disp, input_pc_tiled, target_disp, pred_seg, target_seg, pred_cls, target_cls, pred_mo, target_mo)
+            #oss = get_rec_loss(pred_disp, disp_target, seg)
+            #_, classes = torch.max(pred_disp, -1)
+            pred_seg_acc = (pred_seg.max(dim=-1)[1] == target_seg).float().sum() / target_seg.numel()
+            pred_cls_acc = (pred_cls.max(dim=-1)[1] == target_cls).float().sum() / target_cls.numel()
+            
+            res_dict = {"loss": loss.item(),
+                        "loss_chamfer": loss_chamfer.item(),
+                        "loss_rec": loss_rec.item(),
+                        "loss_disp": loss_disp.item(),
+                        "loss_cls": loss_cls.item(),
+                        "loss_seg": loss_seg.item(),
+                        "loss_mo":  loss_reg.item(),
+                        "seg_acc": pred_seg_acc.item(),
+                        "cls_acc": pred_cls_acc.item()}
+            
             if eval==True:
                 indices = data['index']
                 for i in range(batch_size):
                     savename = test_set.get_name(indices[i])
                     for j in range(num_frame):
                         path = '{}/{}_{}.pts'.format(config.predict_save_path, savename, j+1)
-                        out_pc = pc_in_tiled[i,j,:,:]+preds[i,j,:,:]
+                        out_pc = input_pc_tiled[i,j,:,:]+pred_disp[i,j,:,:]
                         np.savetxt(path, out_pc.detach().cpu().numpy())
-        return ModelReturn(preds, loss, {"loss": loss.item()})
+        return ModelReturn(pred_disp, loss, res_dict)
     return mappnet_fn
 
-'''
-class MAPPNet(nn.Module):
-    def __init__(self, num_classes, input_channels=6, use_xyz=True):
-        super(MAPPNet, self).__init__()
-
-        self.pt2SA = PointnetSAModuleMSG(num_classes, input_channels=0, use_xyz=True)
-        self.lstm = nn.LSTM()
-'''
 class MAPPNet(nn.Module):
     r"""
         PointNet2 with multi-scale grouping
@@ -91,18 +294,18 @@ class MAPPNet(nn.Module):
 
         Parameters
         ----------
-        num_classes: int
-            Number of semantics classes to predict over -- size of softmax classifier that run for each point
-        input_channels: int = 6
-            Number of input channels in the feature descriptor for each point.  If the point cloud is Nx9, this
-            value should be 6 as in an Nx9 point cloud, 3 of the channels are xyz, and 6 are feature descriptors
         use_xyz: bool = True
             Whether or not to use the xyz position of a point as a feature
+        config:  Config=global_config
+            used to configure MAPPNet
     """
 
-    def __init__(self, num_classes, input_channels=6, use_xyz=True, config=global_config):
+    def __init__(self, use_xyz=True, config=global_config):
         super(MAPPNet, self).__init__()
         self.config = config
+        input_channels = config.pc_channel
+        if use_xyz==True:
+            input_channels-=3
 
         self.SA_modules = nn.ModuleList()
         c_in = input_channels
@@ -173,7 +376,41 @@ class MAPPNet(nn.Module):
             pt_utils.Seq(128)
             .conv1d(128, bn=True)
             .dropout()
-            .conv1d(num_classes, activation=None)
+            .conv1d(config.pc_channel, activation=None)
+        )
+        self.cls_FC_layer = (
+            pt_utils.Seq(1024)
+            .fc(512, bn=True)
+            .dropout(0.5)
+            .fc(256, bn=True)
+            .dropout(0.5)
+            .fc(config.num_mo_types, activation=None)
+        )
+        # self.cls_FC_layer = (
+        #     pt_utils.Seq(128)
+        #     .conv1d(128, bn=True)
+        #     .dropout()
+        #     .conv1d(config.num_mo_types, activation=None)
+        # )
+        self.seg_FC_layer = (
+            pt_utils.Seq(128)
+            .conv1d(128, bn=True)
+            .dropout()
+            .conv1d(config.num_segs, activation=None)
+        )
+        # self.reg_FC_layer = (
+        #     pt_utils.Seq(128)
+        #     .conv1d(128, bn=True)
+        #     .dropout()
+        #     .conv1d(config.motion_param_dim, activation=None)
+        # )
+        self.reg_FC_layer = (
+            pt_utils.Seq(1024)
+            .fc(512, bn=True)
+            .dropout(0.5)
+            .fc(256, bn=True)
+            .dropout(0.5)
+            .fc(config.motion_param_dim, activation=None)
         )
 
     def _break_up_pc(self, pc):
@@ -190,7 +427,7 @@ class MAPPNet(nn.Module):
             Parameters
             ----------
             pointcloud: Variable(torch.cuda.FloatTensor)
-                (B, N, 3 + input_channels) tensor
+                (B, N, 3 + config.pc_channel) tensor
                 Point cloud to run predicts on
                 Each point in the point-cloud MUST
                 be formated as (x, y, z, features...)
@@ -261,8 +498,11 @@ class MAPPNet(nn.Module):
             lstm_in = lstm_out
         # (B, F, N, 3)
         pc_frames = torch.stack(pc_frames, dim=1)
-        #print(pc_frames.size())
-        return pc_frames
+
+        pred_cls = self.cls_FC_layer(l_features[-1].squeeze(-1))
+        pred_seg = self.seg_FC_layer(lstm_features[0]).transpose(1, 2).contiguous()
+        pred_reg = self.reg_FC_layer(l_features[-1].squeeze(-1))
+        return pc_frames, pred_cls, pred_seg, pred_reg
 
 if __name__ == "__main__":
     from torch.autograd import Variable

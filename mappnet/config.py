@@ -18,6 +18,8 @@ class Config():
         self.num_point = 1024
         self.num_frame = 5
         self.num_frame_classes = 10
+        self.num_mo_types = 3
+        self.num_segs = 2
         self.batch_size = 32
         self.use_ground_truth_seg = True
         self.use_pred_mo = True
@@ -57,7 +59,7 @@ class Config():
         self.test_datalist_path =os.path.join(self.data_config_path,  'test_{}_{}_{}{}.txt'.format(self.model_name, self.motion_type, self.num_point, self.dataset_suffix))
 
     # train setting
-    def config_train(self, run_message='test'):
+    def config_train(self, run_message='all_losses'):
         self.resume_training = False
         self.runmsg=run_message
         self.max_epoch = 101

@@ -102,7 +102,7 @@ if __name__ == "__main__":
         shuffle=True,
         num_workers=20,
     )
-    model = mappnet_model.MAPPNet(num_classes=3, input_channels=0, use_xyz=True)
+    model = mappnet_model.MAPPNet(use_xyz=True, config=config)
     model.cuda()
     optimizer = optim.Adam(
         model.parameters(), lr=args.lr, weight_decay=args.weight_decay
